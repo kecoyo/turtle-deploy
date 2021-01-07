@@ -1,0 +1,10 @@
+node_modules/
+ignore
+.vscode
+test/remote
+
+playground
+.DS_Store
+notes.md
+.env
+dist
