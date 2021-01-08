@@ -1,105 +1,35 @@
-'use strict';
-
-const upath = require('upath');
-const util = require('util');
-const events = require('events');
-const Promise = require('bluebird');
 const fs = require('fs');
+const path = require('path');
+const upath = require('upath');
+const { EventEmitter } = require('events');
+const Promise = require('bluebird');
+const minimatch = require('minimatch');
 
-var PromiseFtp = require('promise-ftp');
-var PromiseSftp = require('ssh2-sftp-client');
-const lib = require('./lib');
+const FtpClient = require('promise-ftp');
+const SftpClient = require('ssh2-sftp-client');
 
-/* interim structure
-{
-    '/': ['test-inside-root.txt'],
-    'folderA': ['test-inside-a.txt'],
-    'folderA/folderB': ['test-inside-b.txt'],
-    'folderA/folderB/emptyC': [],
-    'folderA/folderB/emptyC/folderD': ['test-inside-d-1.txt', 'test-inside-d-2.txt']
-}
-*/
+const CONNECTED = 'connected';
+const DISCONNECTED = 'disconnected';
 
-const FtpDeployer = function () {
-  // The constructor for the super class.
-  events.EventEmitter.call(this);
-  this.ftp = null;
-  this.eventObject = {
-    totalFilesCount: 0,
-    transferredFileCount: 0,
-    filename: '',
-  };
+class FtpDeploy extends EventEmitter {
+  constructor(config) {
+    super();
+    this.config = config;
+    this.ftp = config.sftp ? new SftpClient() : new FtpClient();
+    this.connectionStatus = DISCONNECTED;
+    this.ftp.on('end', this.handleDisconnect);
+    this.ftp.on('close', this.handleDisconnect);
+  }
 
-  this.makeAllAndUpload = function (remoteDir, filemap) {
-    let keys = Object.keys(filemap);
-    return Promise.mapSeries(keys, (key) => {
-      // console.log("Processing", key, filemap[key]);
-      return this.makeAndUpload(remoteDir, key, filemap[key]);
-    });
-  };
-
-  this.makeDir = function (newDirectory) {
-    if (newDirectory === '/') {
-      return Promise.resolve('unused');
-    } else {
-      return this.ftp.mkdir(newDirectory, true);
-    }
-  };
-  // Creates a remote directory and uploads all of the files in it
-  // Resolves a confirmation message on success
-  this.makeAndUpload = (config, relDir, fnames) => {
-    let newDirectory = upath.join(config.remoteRoot, relDir);
-    return this.makeDir(newDirectory, true).then(() => {
-      // console.log("newDirectory", newDirectory);
-      return Promise.mapSeries(fnames, (fname) => {
-        let tmpFileName = upath.join(config.localRoot, relDir, fname);
-        let tmp = fs.readFileSync(tmpFileName);
-        this.eventObject['filename'] = upath.join(relDir, fname);
-
-        this.emit('uploading', this.eventObject);
-
-        return this.ftp
-          .put(tmp, upath.join(config.remoteRoot, relDir, fname))
-          .then(() => {
-            this.eventObject.transferredFileCount++;
-            this.emit('uploaded', this.eventObject);
-            return Promise.resolve('uploaded ' + tmpFileName);
-          })
-          .catch((err) => {
-            this.eventObject['error'] = err;
-            this.emit('upload-error', this.eventObject);
-            // if continue on error....
-            return Promise.reject(err);
-          });
-      });
-    });
-  };
-
-  // connects to the server, Resolves the config on success
-  this.connect = (config) => {
-    this.ftp = config.sftp ? new PromiseSftp() : new PromiseFtp();
-
-    // sftp client does not provide a connection status
-    // so instead provide one ourselfs
-    if (config.sftp) {
-      this.connectionStatus = 'disconnected';
-      this.ftp.on('end', this.handleDisconnect);
-      this.ftp.on('close', this.handleDisconnect);
-    }
-
+  // Connect to the server
+  connect() {
+    const config = this.config;
     return this.ftp
       .connect(config)
       .then((serverMessage) => {
         this.emit('log', 'Connected to: ' + config.host);
         this.emit('log', 'Connected: Server message: ' + serverMessage);
-
-        // sftp does not provide a connection status
-        // so instead provide one ourself
-        if (config.sftp) {
-          this.connectionStatus = 'connected';
-        }
-
-        return config;
+        this.connectionStatus = CONNECTED;
       })
       .catch((err) => {
         return Promise.reject({
@@ -107,77 +37,177 @@ const FtpDeployer = function () {
           message: 'connect: ' + err.message,
         });
       });
-  };
+  }
 
-  this.getConnectionStatus = () => {
-    // only ftp client provides connection status
-    // sftp client connection status is handled using events
-    return typeof this.ftp.getConnectionStatus === 'function' ? this.ftp.getConnectionStatus() : this.connectionStatus;
-  };
+  // Analysing local firstory
+  canIncludePath(includes, excludes, filePath) {
+    let go = (acc, item) => acc || minimatch(filePath, item, { matchBase: true });
+    let canInclude = includes.reduce(go, false);
 
-  this.handleDisconnect = () => {
-    this.connectionStatus = 'disconnected';
-  };
+    // Now check whether the file should in fact be specifically excluded
+    if (canInclude) {
+      // if any excludes match return false
+      if (excludes) {
+        let go2 = (acc, item) => acc && !minimatch(filePath, item, { matchBase: true });
+        canInclude = excludes.reduce(go2, true);
+      }
+    }
+    // console.log("canIncludePath", include, filePath, res);
+    return canInclude;
+  }
 
-  // creates list of all files to upload and starts upload process
-  this.checkLocalAndUpload = (config) => {
+  // A method for parsing the source location and storing the information into a suitably formated object
+  parseLocal(includes, excludes, localRootDir, relDir) {
+    // reducer
+    let handleItem = (acc, item) => {
+      const currItem = path.join(fullDir, item);
+      const newRelDir = path.relative(localRootDir, currItem);
+
+      if (fs.lstatSync(currItem).isDirectory()) {
+        // currItem is a directory. Recurse and attach to accumulator
+        let tmp = this.parseLocal(includes, excludes, localRootDir, newRelDir);
+        for (let key in tmp) {
+          if (tmp[key].length == 0) {
+            delete tmp[key];
+          }
+        }
+        return Object.assign(acc, tmp);
+      } else {
+        // currItem is a file
+        // acc[relDir] is always created at previous iteration
+        if (this.canIncludePath(includes, excludes, newRelDir)) {
+          // console.log("including", currItem);
+          acc[relDir].push(item);
+          return acc;
+        }
+      }
+      return acc;
+    };
+
+    const fullDir = path.join(localRootDir, relDir);
+    // Check if `startDir` is a valid location
+    if (!fs.existsSync(fullDir)) {
+      throw new Error(fullDir + ' is not an existing location');
+    }
+
+    // Iterate through the contents of the `fullDir` of the current iteration
+    const files = fs.readdirSync(fullDir);
+    // Add empty array, which may get overwritten by subsequent iterations
+    let acc = {};
+    acc[relDir] = [];
+    const res = files.reduce(handleItem, acc);
+    return res;
+  }
+  // Get the list of files to upload
+  listFiles() {
+    const config = this.config;
     try {
-      let filemap = lib.parseLocal(config.include, config.exclude, config.localRoot, '/');
-      // console.log(filemap);
+      let filemap = this.parseLocal(config.include, config.exclude, config.localRoot, '/');
       this.emit('log', 'Files found to upload: ' + JSON.stringify(filemap));
-      this.eventObject['totalFilesCount'] = lib.countFiles(filemap);
 
-      return this.makeAllAndUpload(config, filemap);
+      return filemap;
     } catch (e) {
       return Promise.reject(e);
     }
-  };
+  }
 
-  // Deletes remote directory if requested by config
-  // Returns config
-  this.deleteRemote = (config) => {
-    if (config.deleteRemote) {
-      return lib
-        .deleteDir(this.ftp, config.remoteRoot)
-        .then(() => {
-          this.emit('log', 'Deleted directory: ' + config.remoteRoot);
-          return config;
-        })
-        .catch((err) => {
-          this.emit('log', 'Deleting failed, trying to continue: ' + JSON.stringify(err));
-          return Promise.resolve(config);
-        });
+  // Upload file list
+  upload(filemap) {
+    let keys = Object.keys(filemap);
+    return Promise.mapSeries(keys, (key) => {
+      return this.makeDirAndUpload(key, filemap[key]);
+    });
+  }
+
+  // Create remote directory
+  makeDir(remoteDir) {
+    if (remoteDir === '/') {
+      return Promise.resolve('unused');
+    } else {
+      return this.ftp.mkdir(remoteDir, true);
     }
-    return Promise.resolve(config);
-  };
+  }
 
-  this.deploy = function (config, cb) {
-    return lib
-      .checkIncludes(config)
-      .then(lib.getPassword)
-      .then(this.connect)
-      .then(this.deleteRemote)
-      .then(this.checkLocalAndUpload)
+  // Create a remote directory and upload files
+  makeDirAndUpload(relDir, fnames) {
+    let config = this.config;
+    const remoteDir = upath.join(config.remoteRoot, relDir);
+    return this.makeDir(remoteDir).then(() => {
+      return Promise.mapSeries(fnames, (fname) => {
+        let relFileName = upath.join(relDir, fname);
+        let localFileName = upath.join(config.localRoot, relFileName);
+        let data = fs.readFileSync(localFileName);
+        let eventObject = { filename: relFileName };
+
+        this.emit('uploading', eventObject);
+
+        return this.ftp
+          .put(data, upath.join(remoteDir, fname))
+          .then(() => {
+            this.emit('uploaded', eventObject);
+            return Promise.resolve('uploaded ' + localFileName);
+          })
+          .catch((err) => {
+            eventObject.error = err;
+            this.emit('upload-error', eventObject);
+            // if continue on error....
+            return Promise.reject(err);
+          });
+      });
+    });
+  }
+
+  handleDisconnect() {
+    this.connectionStatus = DISCONNECTED;
+  }
+
+  // Delete all files in the remote directory
+  deleteRemote() {
+    const config = this.config;
+
+    if (!config.deleteRemote) return Promise.resolve(true);
+
+    // 删除目录
+    const deleteDir = (ftp, dir) => {
+      return ftp.list(dir).then((lst) => {
+        let dirNames = lst.filter((f) => f.type == 'd' && f.name != '..' && f.name != '.').map((f) => path.posix.join(dir, f.name));
+
+        let fnames = lst.filter((f) => f.type != 'd').map((f) => path.posix.join(dir, f.name));
+
+        // delete sub-directories and then all files
+        return Promise.mapSeries(dirNames, (dirName) => {
+          // deletes everything in sub-directory, and then itself
+          return deleteDir(ftp, dirName).then(() => ftp.rmdir(dirName));
+        }).then(() => Promise.mapSeries(fnames, (fname) => ftp.delete(fname)));
+      });
+    };
+
+    return deleteDir(this.ftp, config.remoteRoot)
+      .then(() => {
+        this.emit('log', 'Deleted directory: ' + config.remoteRoot);
+        return config;
+      })
+      .catch((err) => {
+        this.emit('log', 'Deleting failed, trying to continue: ' + JSON.stringify(err));
+        return Promise.resolve(config);
+      });
+  }
+
+  deploy() {
+    return this.connect()
+      .then(this.deleteRemote.bind(this))
+      .then(this.listFiles.bind(this))
+      .then(this.upload.bind(this))
       .then((res) => {
         this.ftp.end();
-        if (typeof cb == 'function') {
-          cb(null, res);
-        } else {
-          return Promise.resolve(res);
-        }
+        return Promise.resolve(res);
       })
       .catch((err) => {
         console.log('Err', err.message);
-        if (this.ftp && this.getConnectionStatus() != 'disconnected') this.ftp.end();
-        if (typeof cb == 'function') {
-          cb(err, null);
-        } else {
-          return Promise.reject(err);
-        }
+        if (this.ftp && this.connectionStatus != DISCONNECTED) this.ftp.end();
+        return Promise.reject(err);
       });
-  };
-};
+  }
+}
 
-util.inherits(FtpDeployer, events.EventEmitter);
-
-module.exports = FtpDeployer;
+module.exports = FtpDeploy;
