@@ -1,35 +1,44 @@
-const fs = require('fs');
+const fs = require('fs-extra');
 const path = require('path');
 const upath = require('upath');
 const { EventEmitter } = require('events');
 const Promise = require('bluebird');
 const minimatch = require('minimatch');
+const dateFormat = require('date-format');
 
-const FtpClient = require('promise-ftp');
-const SftpClient = require('ssh2-sftp-client');
-
-const CONNECTED = 'connected';
-const DISCONNECTED = 'disconnected';
+const PromiseFtp = require('promise-ftp');
+const PromiseSftp = require('ssh2-sftp-client');
 
 class FtpDeploy extends EventEmitter {
   constructor(config) {
     super();
     this.config = config;
-    this.ftp = config.sftp ? new SftpClient() : new FtpClient();
-    this.connectionStatus = DISCONNECTED;
-    this.ftp.on('end', this.handleDisconnect);
-    this.ftp.on('close', this.handleDisconnect);
+    this.ftp = null;
+
+    if (config.sftp) {
+      this.ftp = new PromiseSftp();
+      this.connectionStatus = 'disconnected';
+      this.ftp.on('end', this.handleDisconnect);
+      this.ftp.on('close', this.handleDisconnect);
+    } else {
+      this.ftp = new PromiseFtp();
+    }
   }
 
   // Connect to the server
   connect() {
-    const config = this.config;
+    let config = this.config;
     return this.ftp
       .connect(config)
       .then((serverMessage) => {
         this.emit('log', 'Connected to: ' + config.host);
         this.emit('log', 'Connected: Server message: ' + serverMessage);
-        this.connectionStatus = CONNECTED;
+
+        // sftp does not provide a connection status
+        // so instead provide one ourself
+        if (config.sftp) {
+          this.connectionStatus = 'connected';
+        }
       })
       .catch((err) => {
         return Promise.reject({
@@ -37,6 +46,16 @@ class FtpDeploy extends EventEmitter {
           message: 'connect: ' + err.message,
         });
       });
+  }
+
+  getConnectionStatus() {
+    // only ftp client provides connection status
+    // sftp client connection status is handled using events
+    return typeof this.ftp.getConnectionStatus === 'function' ? this.ftp.getConnectionStatus() : this.connectionStatus;
+  }
+
+  handleDisconnect() {
+    this.connectionStatus = 'disconnected';
   }
 
   // Analysing local firstory
@@ -100,7 +119,7 @@ class FtpDeploy extends EventEmitter {
   }
   // Get the list of files to upload
   listFiles() {
-    const config = this.config;
+    let config = this.config;
     try {
       let filemap = this.parseLocal(config.include, config.exclude, config.localRoot, '/');
       this.emit('log', 'Files found to upload: ' + JSON.stringify(filemap));
@@ -137,33 +156,72 @@ class FtpDeploy extends EventEmitter {
         let relFileName = upath.join(relDir, fname);
         let localFileName = upath.join(config.localRoot, relFileName);
         let data = fs.readFileSync(localFileName);
-        let eventObject = { filename: relFileName };
 
-        this.emit('uploading', eventObject);
+        this.emit('log', 'Uploading: ' + relFileName);
 
         return this.ftp
           .put(data, upath.join(remoteDir, fname))
           .then(() => {
-            this.emit('uploaded', eventObject);
+            this.emit('log', 'Uploaded: ' + relFileName);
             return Promise.resolve('uploaded ' + localFileName);
           })
           .catch((err) => {
-            eventObject.error = err;
-            this.emit('upload-error', eventObject);
-            // if continue on error....
             return Promise.reject(err);
           });
       });
     });
   }
 
-  handleDisconnect() {
-    this.connectionStatus = DISCONNECTED;
+  backup() {
+    let config = this.config;
+
+    // close backup
+    if (!config.backup) return Promise.resolve(true);
+
+    let dateDir = dateFormat('yyyy-MM-dd_hhmmss', new Date());
+
+    // 下载目录
+    const downloadDir = (dir) => {
+      return this.ftp.list(dir).then((lst) => {
+        let dirNames = lst.filter((f) => f.type == 'd' && f.name != '..' && f.name != '.').map((f) => path.posix.join(dir, f.name));
+        let fnames = lst.filter((f) => f.type != 'd').map((f) => path.posix.join(dir, f.name));
+
+        // download sub-directories and then all files
+        return Promise.mapSeries(dirNames, (dirName) => {
+          let relName = path.relative(config.remoteRoot, dirName);
+          let localName = upath.join(config.backupRoot, dateDir, relName);
+          fs.ensureDirSync(localName); // 确保目录存在
+          return downloadDir(dirName);
+        }).then(() =>
+          Promise.mapSeries(fnames, (fname) => {
+            let relName = path.relative(config.remoteRoot, fname);
+            let localName = upath.join(config.backupRoot, dateDir, relName);
+            this.emit('log', 'Downloading file: ' + relName);
+            // 写文件
+            if (config.sftp) {
+              return this.ftp.get(fname, fs.createWriteStream(localName));
+            } else {
+              return this.ftp.get(fname).then((stream) => stream.pipe(fs.createWriteStream(localName)));
+            }
+          })
+        );
+      });
+    };
+
+    return downloadDir(config.remoteRoot)
+      .then(() => {
+        this.emit('log', 'Downloaded directory: ' + config.remoteRoot);
+        return true;
+      })
+      .catch((err) => {
+        this.emit('log', 'Downloading failed, trying to continue: ' + JSON.stringify(err));
+        return Promise.resolve(true);
+      });
   }
 
   // Delete all files in the remote directory
   deleteRemote() {
-    const config = this.config;
+    let config = this.config;
 
     if (!config.deleteRemote) return Promise.resolve(true);
 
@@ -185,28 +243,33 @@ class FtpDeploy extends EventEmitter {
     return deleteDir(this.ftp, config.remoteRoot)
       .then(() => {
         this.emit('log', 'Deleted directory: ' + config.remoteRoot);
-        return config;
+        return true;
       })
       .catch((err) => {
         this.emit('log', 'Deleting failed, trying to continue: ' + JSON.stringify(err));
-        return Promise.resolve(config);
+        return Promise.resolve(true);
       });
   }
 
+  finish(res) {
+    this.ftp.end();
+    Promise.resolve(res);
+  }
+
+  catchError(err) {
+    console.log('Err', err.message);
+    if (this.ftp && this.getConnectionStatus() != 'disconnected') this.ftp.end();
+    return Promise.reject(err);
+  }
+
   deploy() {
-    return this.connect()
+    return this.connect() //
+      .then(this.backup.bind(this))
       .then(this.deleteRemote.bind(this))
       .then(this.listFiles.bind(this))
       .then(this.upload.bind(this))
-      .then((res) => {
-        this.ftp.end();
-        return Promise.resolve(res);
-      })
-      .catch((err) => {
-        console.log('Err', err.message);
-        if (this.ftp && this.connectionStatus != DISCONNECTED) this.ftp.end();
-        return Promise.reject(err);
-      });
+      .then(this.finish.bind(this))
+      .catch(this.catchError.bind(this));
   }
 }
 
