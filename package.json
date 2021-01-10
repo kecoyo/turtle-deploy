@@ -23,6 +23,9 @@
     "sftp",
     "deploy"
   ],
+  "files": [
+    "src"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -1,7 +1,0 @@
-.vscode
-.editorconfig
-.eslintrc
-.npmignore
-.prettierrc
-node_modules/
-test
